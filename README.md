@@ -359,9 +359,116 @@ proxy_set_header Host 替换为在 CloudFlare Worker 设置的域名;
 而使用 CloudFlare Worker 搭建..只能说稍微好一点点，如果服务器需要大量拉取镜像的话或许会用到这个方案。
 而将方案一、二整合，几乎就是现阶段最完美的方案了，速度快且不受拉取次数的限制，只要 Docker hub 别乱变，就可以用超久。
 
+# 如果失效，显示
+```
+root@VM-4-14-debian:~# docker pull hub1.nat.tf/library/alpine:latest
+Error response from daemon: Head "https://hub1.nat.tf/v2/library/alpine/manifests/latest": Get "https://auth.docker.io/token?scope=repository%3Alibrary%2Falpine%3Apull&service=registry.docker.io": net/http: request canceled while waiting for connection (Client.Timeout exceeded while awaiting headers)
+```
+# 那就把Nginx的改成如下，根据自己配置来调整，我是基于1panel的OpenResty搭建，记得重载配置
+```
+user  root;
+worker_processes  auto;
+error_log  /var/log/nginx/error.log notice;
+error_log  /dev/stdout notice;
+pid        /var/run/nginx.pid;
 
+events {
+    worker_connections  1024;
+}
 
+http {
+    include       mime.types;
+    default_type  application/octet-stream;
+    log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
+                      '$status $body_bytes_sent "$http_referer" '
+                      '"$http_user_agent" "$http_x_forwarded_for"';
+    server_tokens off;
+    access_log  /var/log/nginx/access.log  main;
+    access_log /dev/stdout main;
+    sendfile        on;
 
+    server_names_hash_bucket_size 512;
+    client_header_buffer_size 32k;
+    client_max_body_size 50m;
+    keepalive_timeout 60;
+    keepalive_requests 100000;
+
+    gzip on;
+    gzip_min_length  1k;
+    gzip_buffers     4 16k;
+    gzip_http_version 1.1;
+    gzip_comp_level 2;
+    gzip_types     text/plain application/javascript application/x-javascript text/javascript text/css application/xml;
+    gzip_vary on;
+    gzip_proxied   expired no-cache no-store private auth;
+    gzip_disable   "MSIE [1-6]\.";
+
+    limit_conn_zone $binary_remote_addr zone=perip:10m;
+    limit_conn_zone $server_name zone=perserver:10m;
+
+    # 反代docker hub镜像源的服务器配置
+    server {
+        listen 443 ssl;
+        server_name 域名;
+
+        ssl_certificate 证书地址;
+        ssl_certificate_key 密钥地址;
+
+        ssl_session_timeout 24h;
+        ssl_ciphers 'ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256';
+        ssl_protocols TLSv1 TLSv1.1 TLSv1.2 TLSv1.3;
+
+        location /v2/ {
+            proxy_pass https://registry-1.docker.io;  # Docker Hub 的官方镜像仓库
+            proxy_set_header Host registry-1.docker.io;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+
+            # 关闭缓存
+            proxy_buffering off;
+
+            # 转发认证相关的头部
+            proxy_set_header Authorization $http_authorization;
+            proxy_pass_header Authorization;
+
+            # 重写 www-authenticate 头为你的反代地址
+            proxy_hide_header www-authenticate;
+            add_header www-authenticate 'Bearer realm="https://域名/token",service="registry.docker.io"' always;
+
+            # 对 upstream 状态码检查，实现 error_page 错误重定向
+            proxy_intercept_errors on;
+            recursive_error_pages on;
+            error_page 301 302 307 = @handle_redirect;
+        }
+
+        # 处理 Docker OAuth2 Token 认证请求
+        location /token {
+            resolver 1.1.1.1 valid=600s;
+            proxy_pass https://auth.docker.io;  # Docker 认证服务器
+
+            proxy_set_header Host auth.docker.io;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+
+            proxy_set_header Authorization $http_authorization;
+            proxy_pass_header Authorization;
+
+            proxy_buffering off;
+        }
+
+        location @handle_redirect {
+            resolver 1.1.1.1;
+            set $saved_redirect_location '$upstream_http_location';
+            proxy_pass $saved_redirect_location;
+        }
+    }
+
+    include /usr/local/openresty/nginx/conf/conf.d/*.conf;
+    include /usr/local/openresty/1pwaf/data/conf/waf.conf;
+}
+```
 
 
 
